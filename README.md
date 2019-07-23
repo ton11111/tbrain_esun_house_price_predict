@@ -31,10 +31,3 @@ Hit-Rate的計算共分為兩步驟，首先比對各筆不動產預測和真實
 ![cmp6_eval4](./misc/cmp6_eval4.png)
 
 ![cmp6_eval5](./misc/cmp6_eval5.png)
-
-## Download Dataset
-
-Please download dataset before you start to excute this program.  
-
-Here: [https://www.kaggle.com/qi4589746/e-sun-ai-house-price](https://www.kaggle.com/qi4589746/e-sun-ai-house-price)
-
