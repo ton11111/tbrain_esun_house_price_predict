@@ -1,4 +1,4 @@
-# TBrain: House Price Predict
+# TBrain: E-Sun House Price Prediction
 
 ![image](https://img.shields.io/badge/python-3.6-blue.svg)
 
