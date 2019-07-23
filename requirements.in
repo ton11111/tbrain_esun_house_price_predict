@@ -1,0 +1,23 @@
+### lint
+flake8==3.7.7
+flake8-docstrings==1.1.0
+flake8-import-order==0.13
+flake8-quotes==0.11.0
+pep8-naming==0.4.1
+
+### core
+jupyter==1.0.0
+numpy==1.15.0
+pandas==0.24.1
+matplotlib==2.2.2
+scipy==1.1.0
+
+### ML
+scikit-learn==0.20.0
+xgboost==0.90
+lightgbm==2.2.3
+tensorflow==1.14.0
+
+### other
+tqdm==4.28.1
+
