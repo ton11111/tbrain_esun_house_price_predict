@@ -14,7 +14,6 @@ xgboost_param = dict(
     reg_alpha=0.0,
     scale_pos_weight=1,
     tree_method='gpu_hist',
-    n_jobs=5,
     verbosity=0,
 )
 
