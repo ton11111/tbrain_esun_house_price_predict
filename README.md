@@ -4,7 +4,7 @@
 
 ## Abstract
 
-Our team "WWW-YCC-IDV-TW" won **No. 1** in the game [玉山人工智慧公開挑戰賽2019夏季賽 - 台灣不動產AI神預測](https://tbrain.trendmicro.com.tw/Competitions/Details/6).  
+Our team "WWW-YCC-IDV-TW" won **1st Place** in the game [玉山人工智慧公開挑戰賽2019夏季賽 - 台灣不動產AI神預測](https://tbrain.trendmicro.com.tw/Competitions/Details/6).  
 This repo shows our method.  
   
 ![private_leaderboard](./misc/private_leaderboard.png)

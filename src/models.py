@@ -3,18 +3,17 @@ import numpy as np
 
 xgboost_param = dict(
     objective='reg:squarederror',
-    max_depth=11,  # 3-10
+    max_depth=11,
     subsample=0.8005630073716024,
     n_estimators=16440,
-    learning_rate=0.00647631488262977,  # 0.01-0.2
+    learning_rate=0.00647631488262977,
     gamma=0.9267584767684108,
-    colsample_bytree=0.9988015932047529,  # 0.5-1
+    colsample_bytree=0.9988015932047529,
     reg_lambda=0.6553015656015893,
     min_child_weight=0.8572504467657722,
     reg_alpha=0.0,
     scale_pos_weight=1,
     tree_method='gpu_hist',
-    n_jobs=32,
     verbosity=0,
 )
 
@@ -62,10 +61,13 @@ def build_dnn_model(cols, seed=None):
     conjugate_embs = []
     for conjugate_cols in conjugate_cols_list:
         emb_unit = int(np.log(len(conjugate_cols)) / np.log(np.sqrt(2.0 * np.pi * np.e))) + 1
-        conjugate_inputs = tf.keras.layers.Lambda(lambda x: tf.gather(x, conjugate_cols, axis=-1))(input)
-        conjugate_emb = tf.keras.layers.Dense(emb_unit, kernel_initializer='lecun_normal')(conjugate_inputs)
+        conjugate_inputs = tf.keras.layers.Lambda(
+            lambda x: tf.gather(x, conjugate_cols, axis=-1))(input)
+        conjugate_emb = \
+            tf.keras.layers.Dense(emb_unit, kernel_initializer='lecun_normal')(conjugate_inputs)
         conjugate_embs.append(conjugate_emb)
-    non_conjugate_inputs = tf.keras.layers.Lambda(lambda x: tf.gather(x, non_conjugate_cols, axis=-1))(input)
+    non_conjugate_inputs = \
+        tf.keras.layers.Lambda(lambda x: tf.gather(x, non_conjugate_cols, axis=-1))(input)
     input_emb = tf.keras.layers.Concatenate()(conjugate_embs + [non_conjugate_inputs])
 
     post_input = tf.keras.layers.Dense(width, kernel_initializer='lecun_normal')(input_emb)

@@ -2,6 +2,7 @@
 max-line-length = 99
 import-order-style = pep8
 extend-ignore = D1
+ignore = N806, W503
 application-import-names =
     config,
     dataloader,
