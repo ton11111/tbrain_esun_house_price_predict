@@ -97,9 +97,6 @@ class GPUController:
 
 pd.set_option('display.max_columns', 5000)
 
-NUM_CV = 5
-N_BAGS = 8
-
 gpu_controller = GPUController()
 
 # Load data
@@ -133,7 +130,7 @@ def fit_xgb(i, X_train_cv, y_train_cv):
     return model
 
 
-runner = CVRunner(train_csv_dsl, NUM_CV, fit_xgb)
+runner = CVRunner(train_csv_dsl, conf.NUM_CV, fit_xgb)
 runner.run(n_jobs=gpu_controller.max_size())
 
 mean_score, mean_loss, out_of_fold_prediction = runner.get_result()
@@ -152,7 +149,7 @@ def fit_lgb(i, X_train_cv, y_train_cv):
     return model
 
 
-runner = CVRunner(train_csv_dsl, NUM_CV, fit_lgb)
+runner = CVRunner(train_csv_dsl, conf.NUM_CV, fit_lgb)
 runner.run(n_jobs=5)
 
 mean_score, mean_loss, out_of_fold_prediction = runner.get_result()
@@ -197,7 +194,7 @@ def fit_dnn(i, X_train_cv, y_train_cv):
     return model
 
 
-runner = CVRunner(train_csv_dsl, NUM_CV, fit_dnn)
+runner = CVRunner(train_csv_dsl, conf.NUM_CV, fit_dnn)
 runner.run(n_jobs=gpu_controller.max_size())
 
 mean_score, mean_loss, out_of_fold_prediction = runner.get_result()
@@ -275,10 +272,10 @@ def worker(i_bag):
 
 n_jobs = gpu_controller.max_size()
 with mp.Pool(n_jobs) as pool:
-    pool.map(worker, range(N_BAGS))
+    pool.map(worker, range(conf.N_BAGS))
 
 bags_pred_orig_ln = list()
-for i in range(N_BAGS):
+for i in range(conf.N_BAGS):
     bags_pred_orig_ln.append(np.load('output_{}.npy'.format(i)))
 
 final_pred = test_csv_dsl.reverse_total_price(np.mean(bags_pred_orig_ln, axis=0))
