@@ -78,8 +78,10 @@ class CVRunner:
 
 
 class GPUController:
-    def __init__(self):
-        self._avail_gpu_list = [0, 3, 5, 6, 7]
+    def __init__(self, avail_gpu_list=None):
+        if not avail_gpu_list:
+            avail_gpu_list = [0]
+        self._avail_gpu_list = avail_gpu_list
         self._queue = mp.Queue()
         for i in self._avail_gpu_list:
             self._queue.put(i)
@@ -97,7 +99,7 @@ class GPUController:
 
 pd.set_option('display.max_columns', 5000)
 
-gpu_controller = GPUController()
+gpu_controller = GPUController(avail_gpu_list=conf.AVAIL_GPU_LIST)
 
 # Load data
 config = DatasetLoaderConfig()

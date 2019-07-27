@@ -7,3 +7,5 @@ TEST_DATASET = os.path.join(DIR_DATA, 'test.csv')
 
 NUM_CV = 5
 N_BAGS = 8
+
+AVAIL_GPU_LIST = [0, 3, 5, 6, 7]
