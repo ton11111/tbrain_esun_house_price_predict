@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 from sklearn import preprocessing
 
+from utils import ReverseEngineer
+
 
 class DatasetLoaderConfig(object):
     def __init__(
@@ -15,7 +17,7 @@ class DatasetLoaderConfig(object):
             'zerofill_parking_price',
             'village_income_median_missing_tag',
             'meanfill_village_income_median',
-            # 'norm_rate', # CHENCHC
+            # 'norm_rate',
             'remove_town',
             'remove_village',
             'remove_town_population',
@@ -49,29 +51,26 @@ class DatasetLoaderConfig(object):
         self.tape = tape if tape is not None else {}
         self.read_mode = read_mode
 
-    def getTransforms(self):
+    def get_transforms(self):
         return self.transforms
 
-    def setTapeRecord(self, transform, record):
+    def set_tape_record(self, transform, record):
         assert self.read_mode is False
         self.tape[transform] = record
 
-    def getTapeRecord(self, transform):
+    def get_tape_record(self, transform):
         assert self.read_mode is True
         return self.tape[transform]
 
-    def toggleReadMode(self, read_mode):
+    def toggle_read_mode(self, read_mode):
         self.read_mode = read_mode
 
-    def isReadMode(self):
+    def is_read_mode(self):
         return self.read_mode
 
 
 class DatasetLoader(object):
-    def __init__(
-        self,
-        config
-    ):
+    def __init__(self, config):
         self.dataset = None
         self.config = config
 
@@ -80,23 +79,25 @@ class DatasetLoader(object):
         self.dataset = pd.read_csv(filename)
 
         # Transform
-        for transform in self.config.getTransforms():
+        for transform in self.config.get_transforms():
             if transform == 'reverse_engineer_total_price':
                 if 'total_price' not in self.dataset:
                     continue
                 confused_total_price = self.dataset['total_price']
-                true_total_price = ((confused_total_price - 196452) / 200) ** (2 / 3) * 10000
+                true_total_price = ReverseEngineer('total_price').transform(confused_total_price)
                 self.dataset['total_price'] = true_total_price
 
             elif transform == 'reverse_engineer_building_area':
                 confused_building_area = self.dataset['building_area']
-                true_building_area = confused_building_area ** (1 / 1.31) / 11.61593
+                true_building_area = \
+                    ReverseEngineer('building_area').transform(confused_building_area)
                 self.dataset['building_area'] = true_building_area
 
             elif transform == 'norm_price_by_area':
                 if 'total_price' not in self.dataset:
                     continue
-                self.dataset['total_price'] = self.dataset['total_price'] / self.dataset['building_area']
+                self.dataset['total_price'] = \
+                    self.dataset['total_price'] / self.dataset['building_area']
 
             elif transform.startswith('zerofill_'):
                 col = transform.replace('zerofill_', '')
@@ -113,61 +114,62 @@ class DatasetLoader(object):
                 self.dataset['{}-sq'.format(col)] = np.sqrt(self.dataset[col])
 
             elif transform == 'village_income_median_missing_tag':
-                self.dataset['village_income_median_missing_tag'] = self.dataset['village_income_median'].isna()
+                self.dataset['village_income_median_missing_tag'] = \
+                    self.dataset['village_income_median'].isna()
 
             elif transform == 'meanfill_village_income_median':
-                if self.config.isReadMode():
-                    mean = self.config.getTapeRecord('meanfill_village_income_median')
+                if self.config.is_read_mode():
+                    mean = self.config.get_tape_record('meanfill_village_income_median')
                 else:
                     mean = np.array(self.dataset['village_income_median'].dropna())
                     mean = np.exp(np.mean(np.log(mean)))
-                    self.config.setTapeRecord('meanfill_village_income_median', mean)
+                    self.config.set_tape_record('meanfill_village_income_median', mean)
                 self.dataset['village_income_median'].fillna(value=mean, inplace=True)
 
             elif transform == 'norm_rate':
-                cols = ['doc_rate', 'master_rate', 'bachelor_rate', 'jobschool_rate', 'highschool_rate',
-                        'junior_rate', 'elementary_rate', 'born_rate', 'death_rate', 'marriage_rate',
-                        'divorce_rate']
-                if self.config.isReadMode():
-                    mean_rate_dict = self.config.getTapeRecord('norm_rate')
+                cols = ['doc_rate', 'master_rate', 'bachelor_rate', 'jobschool_rate',
+                        'highschool_rate', 'junior_rate', 'elementary_rate', 'born_rate',
+                        'death_rate', 'marriage_rate', 'divorce_rate']
+                if self.config.is_read_mode():
+                    mean_rate_dict = self.config.get_tape_record('norm_rate')
                 else:
                     mean_rate_dict = {}
                     for col in cols:
                         mean_rate = (
-                            np.sum(self.dataset['town_population'] * self.dataset[col] * 0.01) /
-                            np.sum(self.dataset['town_population'])
+                            np.sum(self.dataset['town_population'] * self.dataset[col] * 0.01)
+                            / np.sum(self.dataset['town_population'])
                         )
                         mean_rate_dict[col] = mean_rate
-                    self.config.setTapeRecord('norm_rate', mean_rate_dict)
+                    self.config.set_tape_record('norm_rate', mean_rate_dict)
 
                 for col in cols:
                     mean_rate = mean_rate_dict[col]
                     self.dataset[col] = (
-                        (self.dataset[col] * 0.01 - mean_rate) /
-                        np.sqrt(mean_rate * (1.0 - mean_rate) * self.dataset['town_population'])
+                        (self.dataset[col] * 0.01 - mean_rate)
+                        / np.sqrt(mean_rate * (1.0 - mean_rate) * self.dataset['town_population'])
                     )
 
             elif transform == 'removeseries_n':
                 self.dataset.drop(
-                    labels=['N_50', 'N_500', 'N_1000', 'N_5000', 'N_10000'], 
+                    labels=['N_50', 'N_500', 'N_1000', 'N_5000', 'N_10000'],
                     axis=1,
                     inplace=True
                 )
 
             elif transform == 'enumerate_to_onehot':
                 cols = [
-                    'building_material', 'city', 'town', 'village', 'building_type', 
+                    'building_material', 'city', 'town', 'village', 'building_type',
                     'building_use', 'parking_way'
                 ]
                 cols = [col for col in cols if col in self.dataset]
 
-                if self.config.isReadMode():
-                    possible_vals_dict = self.config.getTapeRecord('enumerate_to_onehot')
+                if self.config.is_read_mode():
+                    possible_vals_dict = self.config.get_tape_record('enumerate_to_onehot')
                 else:
                     possible_vals_dict = {}
                     for col in cols:
                         possible_vals_dict[col] = list(self.dataset[col].unique())
-                    self.config.setTapeRecord('enumerate_to_onehot', possible_vals_dict)
+                    self.config.set_tape_record('enumerate_to_onehot', possible_vals_dict)
 
                 for col in cols:
                     enum_val = self.dataset[col]
@@ -203,10 +205,12 @@ class DatasetLoader(object):
                     self.dataset[col] = np.log(self.dataset[col])
 
             elif transform == 'txn_floor_all_flag':
-                self.dataset['txn_floor_all_flag'] = (self.dataset['txn_floor'] == 0.0).astype(np.float32)
+                self.dataset['txn_floor_all_flag'] = \
+                    (self.dataset['txn_floor'] == 0.0).astype(np.float32)
 
             elif transform == 'txn_floor_first_flag':
-                self.dataset['txn_floor_first_flag'] = (self.dataset['txn_floor'] == 1).astype(np.float32)
+                self.dataset['txn_floor_first_flag'] = \
+                    (self.dataset['txn_floor'] == 1).astype(np.float32)
 
             elif transform == 'txn_floor_top_flag':
                 self.dataset['txn_floor_top_flag'] = (
@@ -219,32 +223,38 @@ class DatasetLoader(object):
                 ).astype(np.float32)
 
             elif transform == 'neg_txn_floor':
-                self.dataset['neg_txn_floor'] = self.dataset['total_floor'] - self.dataset['txn_floor']
+                self.dataset['neg_txn_floor'] = \
+                    self.dataset['total_floor'] - self.dataset['txn_floor']
 
             elif transform == 'standard_scalar':
                 exclude_cols = ['total_price', 'building_id']
-                if self.config.isReadMode():
-                    record = self.config.getTapeRecord('standard_scalar')
+                if self.config.is_read_mode():
+                    record = self.config.get_tape_record('standard_scalar')
                 else:
                     record = {}
                     for col in self.dataset.columns:
                         if col in exclude_cols:
                             continue
-                        scalar = preprocessing.StandardScaler().fit(self.dataset[[col]].astype(np.float64))
+                        scalar = preprocessing.StandardScaler().fit(
+                            self.dataset[[col]].astype(np.float64))
                         record[col] = scalar
-                    self.config.setTapeRecord('standard_scalar', record)
+                    self.config.set_tape_record('standard_scalar', record)
 
                 for col in self.dataset.columns:
                     if col in exclude_cols:
                         continue
-                    self.dataset[col] = record[col].transform(self.dataset[[col]].astype(np.float64))
+                    self.dataset[col] = record[col].transform(
+                        self.dataset[[col]].astype(np.float64))
 
             elif transform == 'removeseries_not_important':
                 remove_cols = [
                     'X_index_5000', 'X_index_10000', 'XI_index_10000',
-                    'XIV_index_5000', 'XIV_index_10000', 'XIV_index_1000', 'XII_index_5000', 'XII_index_10000', 'V_index_5000',
-                    'V_index_10000', 'VI_index_5000', 'VI_index_10000', 'VII_index_5000', 'VII_index_10000', 'VIII_index_5000',
-                    'VIII_index_10000', 'I_index_5000', 'I_index_10000', 'IX_index_10000', 'IV_index_10000', 'II_index_5000',
+                    'XIV_index_5000', 'XIV_index_10000', 'XIV_index_1000', 'XII_index_5000',
+                    'XII_index_10000', 'V_index_5000',
+                    'V_index_10000', 'VI_index_5000', 'VI_index_10000', 'VII_index_5000',
+                    'VII_index_10000', 'VIII_index_5000',
+                    'VIII_index_10000', 'I_index_5000', 'I_index_10000', 'IX_index_10000',
+                    'IV_index_10000', 'II_index_5000',
                     'II_index_10000', 'III_index_5000', 'III_index_10000'
                 ]
                 self.dataset.drop(
@@ -254,7 +264,8 @@ class DatasetLoader(object):
                 )
 
             elif transform == 'sqrt_num_facility':
-                classe_list = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII', 'XIII', 'XIV']
+                classe_list = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI',
+                               'XII', 'XIII', 'XIV']
                 radius_list = [10, 50, 100, 250, 500, 1000, 5000, 10000]
                 for cla in classe_list:
                     for r in radius_list:
@@ -262,7 +273,8 @@ class DatasetLoader(object):
                         self.dataset[col] = np.sqrt(self.dataset[col])
 
             elif transform == 'density':
-                classe_list = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII', 'XIII', 'XIV']
+                classe_list = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI',
+                               'XII', 'XIII', 'XIV']
                 radius_list = [10000]
                 for cla in classe_list:
                     for r in radius_list:
@@ -271,12 +283,13 @@ class DatasetLoader(object):
                         self.dataset[new_col] = self.dataset[col] / (3.1415926 * (r**2))
 
             elif transform == 'have_parking':
-                self.dataset['have_parking'] = (self.dataset['parking_area'] > 0.0).astype(np.float32)
+                self.dataset['have_parking'] = \
+                    (self.dataset['parking_area'] > 0.0).astype(np.float32)
 
             else:
-                raise NotImplemented('{} is not a valid transform.'.format(transform))
+                raise NotImplementedError('{} is not a valid transform.'.format(transform))
 
-    def getDataset(self, for_train=False):
+    def get_dataset(self, for_train=False):
         if not for_train:
             return self.dataset
 
@@ -284,7 +297,7 @@ class DatasetLoader(object):
         assert not np.isnan(np.array(dataset)).any()
         return dataset
 
-    def getConfig(self):
+    def get_config(self):
         return self.config
 
     def split(self, val_percentage, rand=False, rand_seed=None):
@@ -307,7 +320,7 @@ class DatasetLoader(object):
             train_dataset = DatasetLoader(self.config)
             train_dataset.dataset = self.dataset[: train_count]
             val_dataset = DatasetLoader(self.config)
-            val_dataset.dataset = self.dataset[train_count: ]
+            val_dataset.dataset = self.dataset[train_count:]
 
         return train_dataset, val_dataset
 
@@ -320,7 +333,7 @@ class DatasetLoader(object):
 
         return train_dataset, val_dataset
 
-    def getFeatureDataset(self):
+    def get_feature(self):
         feature_dataset = self.dataset.drop('building_id', axis=1)
         if 'total_price' in feature_dataset.columns:
             feature_dataset.drop('total_price', axis=1, inplace=True)
@@ -328,33 +341,29 @@ class DatasetLoader(object):
         feature_dataset = feature_dataset.reindex(sorted(feature_dataset.columns), axis=1)
         return feature_dataset
 
-    def getLabelDataset(self):
+    def get_label(self):
         return self.dataset['total_price']
 
     def save(self, filename):
         self.dataset.to_csv(filename)
 
-    def reverseTotalPrice(self, pred_total_price):
-        confused_total_price = pred_total_price
+    def reverse_total_price(self, pred_total_price):
+        x = pred_total_price
         building_area = self.dataset['building_area']
         for transform in reversed(self.config.transforms):
             if transform == 'reverse_engineer_total_price':
-                confused_total_price = 196452 + 200 * ((confused_total_price / 10000) ** (3 / 2))
-
+                x = ReverseEngineer('total_price').reverse_transform(x)
             elif transform == 'norm_price_by_area':
-                confused_total_price = confused_total_price * building_area
-
+                x = x * building_area
             elif transform == 'log_price':
-                confused_total_price = np.exp(confused_total_price) - 1.0
-
+                x = np.exp(x) - 1.0
             elif transform == 'standard_scalar':
-                record = self.config.getTapeRecord('standard_scalar')
+                record = self.config.get_tape_record('standard_scalar')
                 building_area = record['building_area'].inverse_transform(building_area)
-
             elif transform == 'log_area':
                 building_area = np.exp(building_area)
 
-        return confused_total_price
+        return x
 
     def __getitem__(self, key):
         dsl = DatasetLoader(self.config)
