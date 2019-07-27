@@ -19,10 +19,94 @@ from dataloader import DatasetLoaderConfig, DatasetLoader
 from models import xgboost_param, lgb_param, build_dnn_model
 from utils import hit_rate, mean_absolute_percentage_error, score_this_game, calc_mse
 
+
+class CVRunner:
+    def __init__(self, train_csv_dsl, num_cv, fit_model_fn):
+        self._train_csv_dsl = train_csv_dsl
+        self._num_cv = num_cv
+        self._fit_model_fn = fit_model_fn
+        self._losses = []
+        self._scores = []
+
+        self._all_feature = train_csv_dsl.get_feature().values
+
+        index_list = []
+        for train_index, valid_index in KFold(n_splits=num_cv).split(self._all_feature):
+            index_list.append((train_index, valid_index))
+        self._index_list = index_list
+
+        self._out_of_fold_prediction = np.zeros((self._all_feature.shape[0]))
+
+    def run(self, n_jobs=1):
+        with mp.Pool(n_jobs) as pool:
+            results = pool.map(self._worker, range(self._num_cv))
+            for score, loss, valid_index, pred in results:
+                self._losses.append(loss)
+                self._scores.append(score)
+                self._out_of_fold_prediction[valid_index] = pred
+
+    def _worker(self, i):
+        train_index, valid_index = self._index_list[i]
+        train_dsl, valid_dsl = self._train_csv_dsl.split_by_index(train_index, valid_index)
+
+        X_train_cv = train_dsl.get_feature().values
+        y_train_cv = train_dsl.get_label().values
+        X_valid_cv = valid_dsl.get_feature().values
+        y_valid_cv = valid_dsl.get_label().values
+
+        model = self._fit_model_fn(i, X_train_cv, y_train_cv)
+
+        loss = calc_mse(
+            y_true=y_valid_cv,
+            y_pred=model.predict(X_valid_cv),
+        )
+        score = score_this_game(
+            y_true=valid_dsl.reverse_total_price(y_valid_cv),
+            y_pred=valid_dsl.reverse_total_price(model.predict(X_valid_cv)),
+        )
+
+        print(score, loss)
+        pred = model.predict(self._all_feature[valid_index])
+        if len(pred.shape) == 2:
+            assert pred.shape[1] == 1
+            pred.shape = (pred.shape[0], )
+        return score, loss, valid_index, pred
+
+    def is_finished(self):
+        return (len(self._losses) == self._num_cv
+                and len(self._scores) == self._num_cv)
+
+    def get_result(self):
+        if not self.is_finished():
+            print('not finished')
+            return
+        return np.mean(self._scores), np.mean(self._losses), self._out_of_fold_prediction
+
+
+class GPUController:
+    def __init__(self):
+        self._avail_gpu_list = [0, 3, 5, 6, 7]
+        self._queue = mp.Queue()
+        for i in self._avail_gpu_list:
+            self._queue.put(i)
+
+    def get_gpu_id(self):
+        gpu_id = self._queue.get()
+        return gpu_id
+
+    def release_gpu_id(self, gpu_id):
+        self._queue.put(gpu_id)
+
+    def max_size(self):
+        return len(self._avail_gpu_list)
+
+
 pd.set_option('display.max_columns', 5000)
 
 NUM_CV = 5
 N_BAGS = 8
+
+gpu_controller = GPUController()
 
 # Load data
 config = DatasetLoaderConfig()
@@ -37,143 +121,65 @@ test_csv_dsl.load(conf.TEST_DATASET)
 X_test = test_csv_dsl.getFeatureDataset().values
 
 out_of_fold_predictions_dict = {
-    'xgb': np.zeros((X_train_csv.shape[0])),
-    'lgb': np.zeros((X_train_csv.shape[0])),
-    'dnn': np.zeros((X_train_csv.shape[0])),
+    'xgb': None,
+    'lgb': None,
+    'dnn': None,
 }
+
 
 # XGBoost K-fold validation
 print('XGBoost K-fold validation')
-num_cv = NUM_CV
-
-val_loss_queue = queue.Queue()
-score_queue = queue.Queue()
-model_queue = queue.Queue()
-
-index_list = []
-for train_index, valid_index in KFold(n_splits=num_cv).split(X_train_csv):
-    index_list.append((train_index, valid_index))
 
 
-def worker(i):
-    train_index, valid_index = index_list[i]
-    train_dsl, valid_dsl = train_csv_dsl.split_by_index(train_index, valid_index)
-
-    X_train_cv = train_dsl.getFeatureDataset().values
-    y_train_cv = train_dsl.getLabelDataset().values
-    X_valid_cv = valid_dsl.getFeatureDataset().values
-    y_valid_cv = valid_dsl.getLabelDataset().values
-
-    model = xgb.XGBRegressor(**xgboost_param, gpu_id=0)
+def fit_xgb(i, X_train_cv, y_train_cv):
+    gpu_id = gpu_controller.get_gpu_id()
+    model = xgb.XGBRegressor(gpu_id=gpu_id, **xgboost_param)
     model.fit(X_train_cv, y_train_cv)
-
-    val_loss = calc_mse(
-        y_true=y_valid_cv,
-        y_pred=model.predict(X_valid_cv),
-    )
-    score = score_this_game(
-        y_true=valid_dsl.reverseTotalPrice(y_valid_cv),
-        y_pred=valid_dsl.reverseTotalPrice(model.predict(X_valid_cv)),
-    )
-
-    print(score, val_loss)
-    val_loss_queue.put(val_loss)
-    score_queue.put(score)
-    model_queue.put(model)
-    out_of_fold_predictions_dict['xgb'][valid_index] = model.predict(X_train_csv[valid_index])
+    gpu_controller.release_gpu_id(gpu_id)
+    return model
 
 
-for i in range(num_cv):
-    worker(i)
+runner = CVRunner(train_csv_dsl, NUM_CV, fit_xgb)
+runner.run(n_jobs=gpu_controller.max_size())
 
-val_loss_list = np.array([val_loss_queue.get_nowait() for _ in range(num_cv)])
-score_list = np.array([score_queue.get_nowait() for _ in range(num_cv)])
-print('score: {}, loss: {}'.format(np.mean(score_list), np.mean(val_loss_list)))
-
+mean_score, mean_loss, out_of_fold_prediction = runner.get_result()
+out_of_fold_predictions_dict['xgb'] = out_of_fold_prediction
+print('[xgb] score: {}, loss: {}'.format(mean_score, mean_loss))
 print(out_of_fold_predictions_dict['xgb'])
+
 
 # lightgbm K-fold validation
 print('lightGBM K-fold validation')
-val_loss_queue = queue.Queue()
-score_queue = queue.Queue()
-model_queue = queue.Queue()
-record_lock = threading.Lock()
-
-num_cv = NUM_CV
-
-index_list = []
-for train_index, valid_index in KFold(n_splits=num_cv).split(X_train_csv):
-    index_list.append((train_index, valid_index))
 
 
-def worker(i):
-    train_index, valid_index = index_list[i]
-    train_dsl, valid_dsl = train_csv_dsl.split_by_index(train_index, valid_index)
-
-    X_train_cv = train_dsl.getFeatureDataset().values
-    y_train_cv = train_dsl.getLabelDataset().values
-    X_valid_cv = valid_dsl.getFeatureDataset().values
-    y_valid_cv = valid_dsl.getLabelDataset().values
-
+def fit_lgb(i, X_train_cv, y_train_cv):
     model = lgb.LGBMRegressor(**lgb_param)
     model.fit(X_train_cv, y_train_cv)
-
-    val_loss = calc_mse(
-        y_true=y_valid_cv,
-        y_pred=model.predict(X_valid_cv),
-    )
-    score = score_this_game(
-        y_true=valid_dsl.reverseTotalPrice(y_valid_cv),
-        y_pred=valid_dsl.reverseTotalPrice(model.predict(X_valid_cv)),
-    )
-
-    record_lock.acquire()
-    print(score, val_loss)
-    val_loss_queue.put(val_loss)
-    score_queue.put(score)
-    model_queue.put(model)
-    out_of_fold_predictions_dict['lgb'][valid_index] = model.predict(X_train_csv[valid_index])
-    record_lock.release()
+    return model
 
 
-thread_list = []
-for i in range(num_cv):
-    thread = threading.Thread(target=worker, args=(i, ))
-    thread.start()
-    thread_list.append(thread)
-for i in range(num_cv):
-    thread_list[i].join()
+runner = CVRunner(train_csv_dsl, NUM_CV, fit_lgb)
+runner.run(n_jobs=5)
 
-val_loss_list = np.array([val_loss_queue.get_nowait() for _ in range(num_cv)])
-score_list = np.array([score_queue.get_nowait() for _ in range(num_cv)])
-print('score: {}, loss: {}'.format(np.mean(score_list), np.mean(val_loss_list)))
-
+mean_score, mean_loss, out_of_fold_prediction = runner.get_result()
+out_of_fold_predictions_dict['lgb'] = out_of_fold_prediction
+print('[lgb] score: {}, loss: {}'.format(mean_score, mean_loss))
 print(out_of_fold_predictions_dict['lgb'])
+
 
 # DNN K-fold validation
 print('DNN k-fold validation')
+cols = train_csv_dsl.get_feature().columns
 
-val_loss_queue = mt.Queue()
-score_queue = mt.Queue()
-model_queue = mt.Queue()
 
-num_cv = NUM_CV
+def dnn_lr_schd(epoch, lr):
+    if epoch == 100 or epoch == 150:
+        return lr * 0.1
+    else:
+        return lr
 
-index_list = []
-for train_index, valid_index in KFold(n_splits=num_cv).split(X_train_csv):
-    index_list.append((train_index, valid_index))
 
-def worker(i):
-    train_index, valid_index = index_list[i]
-    train_dsl, valid_dsl = train_csv_dsl.split_by_index(train_index, valid_index)
-
-    X_train_cv = train_dsl.getFeatureDataset().values
-    y_train_cv = train_dsl.getLabelDataset().values
-    X_valid_cv = valid_dsl.getFeatureDataset().values
-    y_valid_cv = valid_dsl.getLabelDataset().values
-
-    cols = train_dsl.getFeatureDataset().columns
-
+def fit_dnn(i, X_train_cv, y_train_cv):
     graph = tf.Graph()
     graph.as_default()
     config = tf.ConfigProto()
@@ -181,43 +187,30 @@ def worker(i):
     session = tf.Session(config=config, graph=graph)
     tf.keras.backend.set_session(session)
 
-    model = build_dnn_model(cols)
-
-    valid_cv_pred = [val[0] for val in model.predict(X_train_csv[valid_index])]
-    val_loss = calc_mse(
-        y_true=y_valid_cv,
-        y_pred=valid_cv_pred,
-    )
-    score = score_this_game(
-        y_true=valid_dsl.reverseTotalPrice(y_valid_cv),
-        y_pred=valid_dsl.reverseTotalPrice(valid_cv_pred),
-    )
-
-    print(score, val_loss)
-    val_loss_queue.put(val_loss)
-    score_queue.put(score)
-    model.save_weights('model_cv_{}'.format(i))
+    gpu_id = gpu_controller.get_gpu_id()
+    with tf.device('/gpu:%d' % gpu_id):
+        model = build_dnn_model(cols)
+        reduce_lr = tf.keras.callbacks.LearningRateScheduler(dnn_lr_schd)
+        model.fit(
+            X_train_cv,
+            y_train_cv,
+            epochs=250,
+            batch_size=64,
+            verbose=0,
+            callbacks=[reduce_lr]
+        )
+    gpu_controller.release_gpu_id(gpu_id)
+    return model
 
 
-for i in range(num_cv):
-    worker(i)
+runner = CVRunner(train_csv_dsl, NUM_CV, fit_dnn)
+runner.run(n_jobs=gpu_controller.max_size())
 
-val_loss_list = np.array([val_loss_queue.get_nowait() for _ in range(num_cv)])
-score_list = np.array([score_queue.get_nowait() for _ in range(num_cv)])
-print('score: {}, loss: {}'.format(np.mean(score_list), np.mean(val_loss_list)))
-
-for i in range(num_cv):
-    train_index, valid_index = index_list[i]
-    train_dsl, valid_dsl = train_csv_dsl.split_by_index(train_index, valid_index)
-
-    X_valid_cv = valid_dsl.getFeatureDataset().values
-    y_valid_cv = valid_dsl.getLabelDataset().values
-
-    model = build_dnn_model(valid_dsl.getFeatureDataset().columns)
-    model.load_weights('model_cv_{}'.format(i))
-    out_of_fold_predictions_dict['dnn'][valid_index] = [val[0] for val in model.predict(X_train_csv[valid_index])]
-
+mean_score, mean_loss, out_of_fold_prediction = runner.get_result()
+out_of_fold_predictions_dict['dnn'] = out_of_fold_prediction
+print('[dnn] score: {}, loss: {}'.format(mean_score, mean_loss))
 print(out_of_fold_predictions_dict['dnn'])
+
 
 # Get meta weights for ensembling the 3 models.
 print('Getting meta weights.')
