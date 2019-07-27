@@ -1,14 +1,8 @@
-import os
-import threading
-import queue
-import multiprocessing as mt
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn import linear_model
-from sklearn import preprocessing
-from sklearn.model_selection import train_test_split
 import lightgbm as lgb
 import tensorflow as tf
 from sklearn.model_selection import KFold
@@ -17,7 +11,7 @@ import scipy
 import config as conf
 from dataloader import DatasetLoaderConfig, DatasetLoader
 from models import xgboost_param, lgb_param, build_dnn_model
-from utils import hit_rate, mean_absolute_percentage_error, score_this_game, calc_mse
+from utils import score_this_game, calc_mse, ReverseEngineer
 
 
 class CVRunner:
@@ -112,13 +106,13 @@ gpu_controller = GPUController()
 config = DatasetLoaderConfig()
 train_csv_dsl = DatasetLoader(config=config)
 train_csv_dsl.load(conf.TRAIN_DATASET)
-X_train_csv = train_csv_dsl.getFeatureDataset().values
-y_train_csv = train_csv_dsl.getLabelDataset().values
+X_train_csv = train_csv_dsl.get_feature().values
+y_train_csv = train_csv_dsl.get_label().values
 
-config.toggleReadMode(True)
+config.toggle_read_mode(True)
 test_csv_dsl = DatasetLoader(config=config)
 test_csv_dsl.load(conf.TEST_DATASET)
-X_test = test_csv_dsl.getFeatureDataset().values
+X_test = test_csv_dsl.get_feature().values
 
 out_of_fold_predictions_dict = {
     'xgb': None,
@@ -223,10 +217,6 @@ def fun(x):
     x = np.exp(x) / np.sum(np.exp(x))
     pred = np.sum(meta_feature * x, axis=-1)
     mse = calc_mse(y_train_csv, pred)
-    score = score_this_game(
-        y_true=train_csv_dsl.reverseTotalPrice(y_train_csv),
-        y_pred=train_csv_dsl.reverseTotalPrice(pred),
-    )
     return mse
 
 
@@ -234,37 +224,40 @@ result = scipy.optimize.basinhopping(fun, (0.0, 0.0, 0.0), niter=1000, disp=True
 meta_weight = np.exp(result.x) / np.sum(np.exp(result.x))
 print(meta_weight)
 
+
 # Generate initial guess by ensembling the outputs of the 3 models, each with 8 bags.
-n_bags = N_BAGS
 
 
 def worker(i_bag):
+    gpu_id = gpu_controller.get_gpu_id()
     base_models = {
-        'xgb': xgb.XGBRegressor(**xgboost_param, random_state=hash(i_bag), gpu_id=0),
-        'lgb': lgb.LGBMRegressor(**lgb_param, random_state=hash(i_bag)),
-        'dnn': build_dnn_model(train_csv_dsl.getFeatureDataset().columns, seed=hash(i_bag)),
+        'xgb': xgb.XGBRegressor(random_state=hash(i_bag), gpu_id=gpu_id, **xgboost_param),
+        'lgb': lgb.LGBMRegressor(random_state=hash(i_bag), **lgb_param),
+        'dnn': build_dnn_model(train_csv_dsl.get_feature().columns, seed=hash(i_bag)),
     }
 
     for name, model in base_models.items():
         if name == 'dnn':
-            def lr_schd(epoch, lr):
-                if epoch == 100 or epoch == 150:
-                    return lr * 0.1
-                else:
-                    return lr
+            graph = tf.Graph()
+            graph.as_default()
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            session = tf.Session(config=config, graph=graph)
+            tf.keras.backend.set_session(session)
 
-            reduce_lr = tf.keras.callbacks.LearningRateScheduler(lr_schd)
-
-            model.fit(
-                X_train_csv,
-                y_train_csv,
-                epochs=250,
-                batch_size=64,
-                verbose=2,
-                callbacks=[reduce_lr]
-            )
+            with tf.device('/gpu:%d' % gpu_id):
+                reduce_lr = tf.keras.callbacks.LearningRateScheduler(dnn_lr_schd)
+                model.fit(
+                    X_train_csv,
+                    y_train_csv,
+                    epochs=250,
+                    batch_size=64,
+                    verbose=0,
+                    callbacks=[reduce_lr]
+                )
         else:
             model.fit(X_train_csv, y_train_csv)
+    gpu_controller.release_gpu_id(gpu_id)
 
     meta_feature_test = []
     for name, model in sorted(base_models.items()):
@@ -280,43 +273,40 @@ def worker(i_bag):
     np.save('output_{}'.format(i_bag), pred_orig_ln)
 
 
-for i in range(n_bags):
-    worker(i)
+n_jobs = gpu_controller.max_size()
+with mp.Pool(n_jobs) as pool:
+    pool.map(worker, range(N_BAGS))
 
 bags_pred_orig_ln = list()
-for i in range(n_bags):
+for i in range(N_BAGS):
     bags_pred_orig_ln.append(np.load('output_{}.npy'.format(i)))
 
-final_pred = test_csv_dsl.reverseTotalPrice(np.mean(bags_pred_orig_ln, axis=0))
+final_pred = test_csv_dsl.reverse_total_price(np.mean(bags_pred_orig_ln, axis=0))
 
 ans = pd.DataFrame()
-ans['building_id'] = test_csv_dsl.getDataset()['building_id']
+ans['building_id'] = test_csv_dsl.get_dataset()['building_id']
 ans['total_price'] = final_pred
 original_ans = ans.copy()
 print(ans)
+
 
 # Post processing
 print('Do post processing')
 
 
-def to_confused(x):
-    return (x / 10000.0) ** (3.0 / 2.0) * 200 + 196452
-
-
-def to_orig(x):
-    return ((x - 196452) / 200) ** (2 / 3) * 10000
-
-
 def find_close_hot_prices(x):
     if x < 10000000:
-        low = (int(x) // 50000) * 50000
+        grid_unit = 50000
+        low = (int(x) // grid_unit) * grid_unit
         high = low + 50000
     elif x < 100000000:
-        low = (int(x) // 500000) * 500000
-        high = low + 500000
+        grid_unit = 500000
+        low = (int(x) // grid_unit) * grid_unit
+        high = low + grid_unit
     else:
-        low = (int(x) // 5000000) * 5000000
-        high = low + 5000000
+        grid_unit = 5000000
+        low = (int(x) // grid_unit) * grid_unit
+        high = low + grid_unit
     return high, low
 
 
@@ -335,26 +325,33 @@ def find_hot_prices(low, high):
     return results
 
 
-orig_vals = np.round(to_orig(train_csv_dsl.reverseTotalPrice(y_train_csv)))
+def calc_prob_pred_over_actual_hot(pred_orig, hot_orig):
+    # from Bayes' theorem: P(actal hot | pred) * P(pred) = P(pred | actual hot) * P(actual hot)
+    # we want to evaluate P(actal hot | pred) at one prediction result
+    # P(pred) is a same value for all evaluated case
 
-
-def calc_fitness(pred_orig, hot_orig):
     pred_ln = np.log(pred_orig)
     hot_ln = np.log(hot_orig)
+
+    # use normal distribution to discribe P(pred | actual hot)
     std = 0.12
+    prob_pred_over_actual_hot = \
+        np.exp(-(pred_ln - hot_ln) ** 2 / (2 * std ** 2)) / (np.sqrt(2 * np.pi) * std)
+    # P(actual hot)
+    prob_actual_hot = np.count_nonzero(orig_vals == np.round(hot_orig)) / len(orig_vals)
+    return prob_pred_over_actual_hot * prob_actual_hot
 
-    prob_pred_over_hot = np.exp(-(pred_ln - hot_ln) ** 2 / (2 * std ** 2)) / (np.sqrt(2 * np.pi) * std)
-    prob_hot = np.count_nonzero(orig_vals == np.round(hot_orig)) / len(orig_vals)
-    return prob_pred_over_hot * prob_hot
 
+price_converter = ReverseEngineer('total_price')
+orig_vals = np.round(price_converter.transform(train_csv_dsl.reverse_total_price(y_train_csv)))
 
 init_pred_confused = np.array(original_ans['total_price'])
-init_pred_orig = to_orig(init_pred_confused)
+init_pred_orig = price_converter.transform(init_pred_confused)
 ans['total_price'] = init_pred_confused
 
 for i in range(1):
     pred_confused = np.array(ans['total_price'])
-    pred_orig = to_orig(pred_confused)
+    pred_orig = price_converter.transform(pred_confused)
 
     eps = 1e-8
     new_pred_confused = []
@@ -362,18 +359,18 @@ for i in range(1):
     for i in range(len(pred_confused)):
         pred_confused_i = pred_confused[i]
 
+        # +/- 10% coverage
         highbound_confused_i = pred_confused_i / 0.9
         lowbound_confused_i = pred_confused_i / 1.1
 
-        highbound_orig_i = to_orig(highbound_confused_i)
-        lowbound_orig_i = to_orig(lowbound_confused_i)
+        highbound_orig_i = price_converter.transform(highbound_confused_i)
+        lowbound_orig_i = price_converter.transform(lowbound_confused_i)
 
         higher_orig_i, _ = find_close_hot_prices(highbound_orig_i)
         _, lower_orig_i = find_close_hot_prices(lowbound_orig_i)
 
-        to_confused_ln = lambda x: np.log(to_confused(x))
-        higher_confused_ln_i = to_confused_ln(higher_orig_i)
-        lower_confused_ln_i = to_confused_ln(lower_orig_i)
+        higher_confused_ln_i = np.log(price_converter.reverse_transform(higher_orig_i))
+        lower_confused_ln_i = np.log(price_converter.reverse_transform(lower_orig_i))
 
         highbound_confused_ln_i = np.log(highbound_confused_i)
         lowbound_confused_ln_i = np.log(lowbound_confused_i)
@@ -381,27 +378,29 @@ for i in range(1):
         higher_dist_confused_ln_i = higher_confused_ln_i - highbound_confused_ln_i
         lower_dist_confused_ln_i = lowbound_confused_ln_i - lower_confused_ln_i
 
-        higher_new_lowbound_orig_i = to_orig(np.exp(lowbound_confused_ln_i + higher_dist_confused_ln_i))
-        lower_new_highbound_orig_i = to_orig(np.exp(highbound_confused_ln_i - lower_dist_confused_ln_i))
-
-        higher_gain = calc_fitness(init_pred_orig[i], higher_orig_i)
-        lower_gain = calc_fitness(init_pred_orig[i], lower_orig_i)
-
+        # when price go up
+        higher_gain = calc_prob_pred_over_actual_hot(init_pred_orig[i], higher_orig_i)
+        higher_new_lowbound_orig_i = \
+            price_converter.transform(np.exp(lowbound_confused_ln_i + higher_dist_confused_ln_i))
         higher_loss = sum([
-            calc_fitness(init_pred_orig[i], hot_orig)
+            calc_prob_pred_over_actual_hot(init_pred_orig[i], hot_orig)
             for hot_orig in find_hot_prices(lowbound_orig_i, higher_new_lowbound_orig_i)
         ])
+        higher_net = higher_gain - higher_loss
+        higher_feasible_i = (higher_loss < higher_gain)
+
+        # when price go down
+        lower_gain = calc_prob_pred_over_actual_hot(init_pred_orig[i], lower_orig_i)
+        lower_new_highbound_orig_i = \
+            price_converter.transform(np.exp(highbound_confused_ln_i - lower_dist_confused_ln_i))
         lower_loss = sum([
-            calc_fitness(init_pred_orig[i], hot_orig)
+            calc_prob_pred_over_actual_hot(init_pred_orig[i], hot_orig)
             for hot_orig in find_hot_prices(lower_new_highbound_orig_i, highbound_orig_i)
         ])
-
-        higher_net = higher_gain - higher_loss
         lower_net = lower_gain - lower_loss
-
-        higher_feasible_i = (higher_loss < higher_gain)
         lower_feasible_i = (lower_loss < lower_gain)
 
+        # adjust price
         new_pred_confused_ln_i = np.log(pred_confused_i)
 
         if higher_feasible_i and lower_feasible_i:
@@ -416,15 +415,15 @@ for i in range(1):
         else:
             new_pred_confused_ln_i = None
 
-        if new_pred_confused_ln_i != None:
+        if new_pred_confused_ln_i is not None:
             n_altered += 1
             new_pred_confused_i = np.exp(new_pred_confused_ln_i)
             new_pred_confused.append(new_pred_confused_i)
 
             if new_pred_confused_i > pred_confused_i:
-                assert to_orig(new_pred_confused_i / 0.9) > higher_orig_i
+                assert price_converter.transform(new_pred_confused_i / 0.9) > higher_orig_i
             else:
-                assert to_orig(new_pred_confused_i / 1.1) < lower_orig_i
+                assert price_converter.transform(new_pred_confused_i / 1.1) < lower_orig_i
         else:
             new_pred_confused.append(pred_confused_i)
 
@@ -433,7 +432,9 @@ for i in range(1):
 
     if n_altered == 0:
         break
+
 print(ans)
+
 
 # Save the output csv
 csv = ans.to_csv('data.csv', index=False)
